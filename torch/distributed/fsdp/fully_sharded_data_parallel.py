@@ -262,6 +262,7 @@ class StateDictType(Enum):
     LOCAL_STATE_DICT = auto()
     SHARDED_STATE_DICT = auto()
 
+
 @dataclass
 class StateDictConfig:
     """
@@ -271,6 +272,7 @@ class StateDictConfig:
     implementation FSDP will use.
     """
     pass
+
 
 @dataclass
 class FullStateDictConfig(StateDictConfig):
@@ -2582,6 +2584,55 @@ class FullyShardedDataParallel(nn.Module):
                 # be multiple in the case of nested FSDP modules
                 param_name = param_name.replace(FSDP_PREFIX, "")
             yield (param_name, param)
+
+    def named_modules(
+        self,
+        *args,
+        **kwargs,
+    ) -> Iterator[Tuple[str, torch.nn.Module]]:
+        """
+        Overrides :meth:`named_modules()` to remove FSDP and FlattenParamsWrapper wraps and
+        return the original named_modules when inside the :meth:`summon_full_params` context manager.
+        """
+        in_summon_full_params = self.training_state == TrainingState_.SUMMON_FULL_PARAMS
+        if not in_summon_full_params:
+            return super().named_modules(*args, **kwargs)
+        return self._named_modules_summon_full_params(*args, **kwargs)
+
+    def _named_modules_summon_full_params(
+        self,
+        *args,
+        **kwargs,
+    ) -> Iterator[Tuple[str, torch.nn.Module]]:
+        # TODO: add comments here
+        # TODO:
+        unwrap_wrap_dict : Dict[torch.nn.Module, FullyShardedDataParallel] = dict()
+
+        def unwrap(fsdp_module : FullyShardedDataParallel) -> torch.nn.Module:
+            return fsdp_module.module.module
+
+        def _recursive_unwrap(module : torch.nn.Module) -> torch.nn.Module:
+            for name, child in module.named_children():
+                unwrapped_child = _recursive_unwrap(child)
+                setattr(module, name, unwrapped_child)
+            if isinstance(module, FullyShardedDataParallel):
+                unwrapped_module = unwrap(module)
+                unwrap_wrap_dict[unwrapped_module] = module
+                return unwrapped_module
+            return module
+
+        def _recursive_wrap_back(module : torch.nn.Module) -> torch.nn.Module:
+            for name, child in module.named_children():
+                wrapped_child = _recursive_wrap_back(child)
+                setattr(module, name, wrapped_child)
+            if module in unwrap_wrap_dict:
+                return unwrap_wrap_dict[module]
+            return module
+
+        unwrapped_module = _recursive_unwrap(self)
+        for name, module in unwrapped_module.named_modules(*args, **kwargs):
+            yield (name, module)
+        _recursive_wrap_back(unwrapped_module)
 
     def _register_pre_backward_hooks(self, outputs: Any) -> Any:
         """Register pre-backward hook to run before the wrapped module's
