@@ -3094,8 +3094,8 @@ class FullyShardedDataParallel(nn.Module):
             # Let the parameters in self._fsdp_named_params_exec_order ordered based on
             # the execution order in the forward pass.
             self._fsdp_named_params_exec_order.reverse()
-            # self._remove_inner_fsdp_wraps()
-            # self._patch_forwards()
+            self._remove_inner_fsdp_wraps()
+            self._patch_forwards()
 
     def _recursive_unwrap(self, module : torch.nn.Module) -> torch.nn.Module:
         for name, child in module.named_children():
@@ -3118,18 +3118,29 @@ class FullyShardedDataParallel(nn.Module):
 
     def _patch_forwards(self):
         self._module_to_forward_map : Dict[torch.nn.Module, Callable] = dict()
-        for module in self.modules():
-            if module is self:
-                self.forward = self.module.forward
-            else:
+        assert (
+            len(self.module_fsdpwrap_map) > 0
+        ), "self.module_fsdpwrap_map needs to be not empty."
+        for module in self.module_fsdpwrap_map:
+            if module is not self:
                 module.forward = self._patch_forward(module)
+            self.forward = self.module.forward
+
+    def _patch_forward(self, module):
+
+        def patched_forward(self, *args: Any, **kwargs: Any) -> Any:
+            # TODO (linjianma): Before each forward(), rebuild_full_params of all parameters that are currently sharded and
+            # will be used in the forward, and reshard all parameters that are currently full and will not be
+            # used in the next forward()
+            outputs = module(*args, **kwargs)
+            # TODO (linjianma): After each forward(), reshard all parameters just used in the forward, and rebuild_full_params of
+            # all parameters that will be used next.
+
+        return patched_forward
         # TODO (linjianma): Based on self._fsdp_named_params_exec_order, get the information
         # needed to patch the forward() function of each key in the module_fsdpwrap_map. The rules are as follows:
-        # 1: Before each forward(), rebuild_full_params of all parameters that are currently sharded and
-        # will be used in the forward, and reshard all parameters that are currently full and will not be
-        # used in the next forward()
-        # 2: After each forward(), reshard all parameters just used in the forward, and rebuild_full_params of
-        # all parameters that will be used next.
+
+
         # TODO (linjianma): Patch the forward of each model in the keys
         # of module_fsdpwrap_map based on the information above.
 
