@@ -1123,14 +1123,12 @@ class FullyShardedDataParallel(nn.Module):
         assert self._is_root is not None
         return self._is_root
 
-    @property
     def use_param_exec_order_policy(self) -> bool:
         return (
             hasattr(self, "_use_param_exec_order_policy")
             and self._use_param_exec_order_policy
         )
 
-    @property
     def is_param_exec_order_prep_stage(self) -> bool:
         is_prep_stage = (
             hasattr(self, "_param_exec_order_prep_stage")
@@ -3096,19 +3094,44 @@ class FullyShardedDataParallel(nn.Module):
             # Let the parameters in self._fsdp_named_params_exec_order ordered based on
             # the execution order in the forward pass.
             self._fsdp_named_params_exec_order.reverse()
-            # TODO (linjianma): Construct a fsdp_wrap_map whose keys are all children modules with a FSDP wrap,
-            # and values are its FSDP wraps. These children FSDP wraps will be detached from the root FSDP module
-            # and will be used to schedule the parameters (rebuild_full_params and reshard).
-            # TODO (linjianma): Remove all internal FSDP wraps from the root FSDP module.
-            # TODO (linjianma): Based on self._fsdp_named_params_exec_order, get the information
-            # needed to patch the forward() function of each key in the fsdp_wrap_map. The rules are as follows:
-            # 1: Before each forward(), rebuild_full_params of all parameters that are currently sharded and
-            # will be used in the forward, and reshard all parameters that are currently full and will not be
-            # used in the next forward()
-            # 2: After each forward(), reshard all parameters just used in the forward, and rebuild_full_params of
-            # all parameters that will be used next.
-            # TODO (linjianma): Patch the forward of each model in the keys
-            # of fsdp_wrap_map based on the information above.
+            # self._remove_inner_fsdp_wraps()
+            # self._patch_forwards()
+
+    def _recursive_unwrap(self, module : torch.nn.Module) -> torch.nn.Module:
+        for name, child in module.named_children():
+            unwrapped_child = self._recursive_unwrap(child)
+            setattr(module, name, unwrapped_child)
+        if isinstance(module, FullyShardedDataParallel):
+            unwrapped_module = module.module
+            self.module_fsdpwrap_map[unwrapped_module] = module
+            return unwrapped_module
+        return module
+
+    def _remove_inner_fsdp_wraps(self) -> None:
+        # TODO (linjianma): Construct a module_fsdpwrap_map whose keys are all children modules with a FSDP wrap,
+        # and values are its FSDP wraps. These children FSDP wraps will be detached from the root FSDP module
+        # and will be used to schedule the parameters (rebuild_full_params and reshard).
+        # TODO (linjianma): Remove all internal FSDP wraps from the root FSDP module.
+        self.module_fsdpwrap_map : Dict[torch.nn.Module, FullyShardedDataParallel] = dict()
+        unwrapped_module = self._recursive_unwrap(self)
+        return self.module_fsdpwrap_map[unwrapped_module]
+
+    def _patch_forwards(self):
+        self._module_to_forward_map : Dict[torch.nn.Module, Callable] = dict()
+        for module in self.modules():
+            if module is self:
+                self.forward = self.module.forward
+            else:
+                module.forward = self._patch_forward(module)
+        # TODO (linjianma): Based on self._fsdp_named_params_exec_order, get the information
+        # needed to patch the forward() function of each key in the module_fsdpwrap_map. The rules are as follows:
+        # 1: Before each forward(), rebuild_full_params of all parameters that are currently sharded and
+        # will be used in the forward, and reshard all parameters that are currently full and will not be
+        # used in the next forward()
+        # 2: After each forward(), reshard all parameters just used in the forward, and rebuild_full_params of
+        # all parameters that will be used next.
+        # TODO (linjianma): Patch the forward of each model in the keys
+        # of module_fsdpwrap_map based on the information above.
 
     def _update_p_data(self, p, output_tensor: torch.Tensor) -> None:
         """
