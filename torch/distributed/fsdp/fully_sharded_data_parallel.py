@@ -631,6 +631,7 @@ class FullyShardedDataParallel(nn.Module):
         sync_module_states: bool = False,
     ):
         if isinstance(auto_wrap_policy, ParamExecOrderWrapPolicy):
+            trace_graph : torch.fx.Graph = torch.fx.symbolic_trace(module).graph
             self.__init__(
                 module=module,
                 process_group=process_group,
@@ -644,16 +645,47 @@ class FullyShardedDataParallel(nn.Module):
                 device_id=device_id,
                 sync_module_states=sync_module_states,
             )
-            self._use_param_exec_order_policy : bool = True
-            # self._param_exec_order_prep_stage is set to True in the first forward and backward iteration,
-            # and set to False otherwise.
-            self._param_exec_order_prep_stage : bool = True
+            # Construct a module_fsdpwrap_map whose keys are all children modules with a FSDP wrap,
+            # and values are its FSDP wraps. These children FSDP wraps will be detached from the root FSDP module
+            # and will be used to schedule the parameters (rebuild_full_params and reshard).
+            self.module_fsdpwrap_map : Dict[torch.nn.Module, FullyShardedDataParallel] = dict()
+            # Remove all internal FSDP wraps from the root FSDP module.
+            self._remove_inner_fsdp_wraps()
+            # get all leave and non-leave modules
+            non_leave_modules : List[torch.nn.Module] = []
+            for module, wrap in self.module_fsdpwrap_map.items():
+                for m in wrap.modules():
+                    if m is not wrap and isinstance(m, FullyShardedDataParallel):
+                        non_leave_modules.append(module)
+                        break
+            leave_modules : List[torch.nn.Module] = list(set(self.module_fsdpwrap_map.keys()) - set(non_leave_modules))
+            # for all non-leave modules, get all their parameter names in module
+            non_leave_module_params_name_map : Dict[torch.nn.Module, List[str]] = dict()
+            for m in non_leave_modules:
+                param_names : List[str] = [n for (_, n) in self.module_fsdpwrap_map[m]._fsdp_wrapped_module.param_set]
+                non_leave_module_params_name_map[m] = param_names
             # A list that stores the flatten parameters and its name based on the parameter execution order
             self._fsdp_named_params_exec_order: List[Tuple[str, FlatParameter]] = []
-            for m in self.modules():
-                if m is not self and isinstance(m, FullyShardedDataParallel):
-                    m._fsdp_named_params_exec_order = self._fsdp_named_params_exec_order
-            self._register_params_exec_order_hook()
+            # TODO: get all the parameters that will be ordered
+            # 1. for all leave modules, add them to _fsdp_named_params_exec_order whenever they are called
+            # 2. for all non-leave modules, add them to _fsdp_named_params_exec_order only if their params are called.
+            self._get_params_exec_order(
+                trace_graph,
+                leave_modules,
+                non_leave_modules,
+                non_leave_module_params_name_map
+            )
+
+            # # TODO: get the parameter ordering
+            self._use_param_exec_order_policy : bool = True
+            # # self._param_exec_order_prep_stage is set to True in the first forward and backward iteration,
+            # # and set to False otherwise.
+            # self._param_exec_order_prep_stage : bool = True
+            # for m in self.modules():
+            #     if m is not self and isinstance(m, FullyShardedDataParallel):
+            #         m._fsdp_named_params_exec_order = self._fsdp_named_params_exec_order
+            # TODO: remove this
+            # self._register_params_exec_order_hook()
             return
 
         torch._C._log_api_usage_once("torch.distributed.fsdp")
@@ -1129,17 +1161,17 @@ class FullyShardedDataParallel(nn.Module):
             and self._use_param_exec_order_policy
         )
 
-    def is_param_exec_order_prep_stage(self) -> bool:
-        is_prep_stage = (
-            hasattr(self, "_param_exec_order_prep_stage")
-            and self._param_exec_order_prep_stage
-        )
-        if not is_prep_stage:
-            for p in self.parameters():
-                assert (
-                    not hasattr(p, "_params_exec_order_hook_handle")
-                ), "When not in execution order prep stage, all _params_exec_order_hook_handle should be removed."
-        return is_prep_stage
+    # def is_param_exec_order_prep_stage(self) -> bool:
+    #     is_prep_stage = (
+    #         hasattr(self, "_param_exec_order_prep_stage")
+    #         and self._param_exec_order_prep_stage
+    #     )
+    #     if not is_prep_stage:
+    #         for p in self.parameters():
+    #             assert (
+    #                 not hasattr(p, "_params_exec_order_hook_handle")
+    #             ), "When not in execution order prep stage, all _params_exec_order_hook_handle should be removed."
+    #     return is_prep_stage
 
     @staticmethod
     def fsdp_modules(
@@ -2312,15 +2344,48 @@ class FullyShardedDataParallel(nn.Module):
             return self.load_state_dict(state_dict, strict)
 
     def _params_exec_order_hook(self, named_param: Tuple[str, FlatParameter], *unused: Any) -> None:
+        # TODO: remove
         # In self._fsdp_named_params_exec_order, the parameters are ordered based on
         # the execution order in the backward pass.
         self._fsdp_named_params_exec_order.append(named_param)
 
     def _register_params_exec_order_hook(self) -> None:
+        # TODO: remove
         for (n, p) in self.named_parameters():
             if p.requires_grad:
                 p._params_exec_order_hook_handle = p.register_hook(
                     functools.partial(self._params_exec_order_hook, (n, p)))
+
+            self._remove_inner_fsdp_wraps()
+            self._patch_forwards()
+
+    def _get_params_exec_order(
+        self,
+        trace_graph : torch.fx.Graph,
+        leave_modules : List[torch.nn.Module],
+        non_leave_modules : List[torch.nn.Module],
+        non_leave_module_params_name_map : Dict[torch.nn.Module, List[str]],
+    ) -> None:
+        self._fsdp_named_params_exec_order = [self.layer0.params[0], self.layer1.params[0], self.layer1.params[0], self.layer1.params[0]]
+        print(self._fsdp_named_params_exec_order)
+        # return self.params
+        # for node in list(trace_graph.nodes):
+        #     return
+
+    def _recursive_unwrap(self, module : torch.nn.Module) -> torch.nn.Module:
+        for name, child in module.named_children():
+            unwrapped_child = self._recursive_unwrap(child)
+            setattr(module, name, unwrapped_child)
+        if isinstance(module, FullyShardedDataParallel):
+            unwrapped_module = module.module
+            self.module_fsdpwrap_map[unwrapped_module] = module
+            return unwrapped_module
+        return module
+
+    def _remove_inner_fsdp_wraps(self) -> None:
+        # Remove all internal FSDP wraps from the root FSDP module.
+        unwrapped_module = self._recursive_unwrap(self)
+        return self.module_fsdpwrap_map[unwrapped_module]
 
     def flatten_named_params_exec_order(self):
         return self._fsdp_named_params_exec_order
@@ -3088,35 +3153,17 @@ class FullyShardedDataParallel(nn.Module):
                     # reset this flag for cases like "one forward pass + multiple backward passes"
                     self._post_backward_callback_queued = False
 
-        if (self.use_param_exec_order_policy() and self._param_exec_order_prep_stage):
-            self._param_exec_order_prep_stage = False
-            # Remove the hooks used in the use_param_exec_order_policy
-            for p in self.parameters():
-                if hasattr(p, "_params_exec_order_hook_handle"):
-                    p._params_exec_order_hook_handle.remove()
-                    delattr(p, "_params_exec_order_hook_handle")
+        if self.use_param_exec_order_policy():
+            # # Remove the hooks used in the use_param_exec_order_policy
+            # for p in self.parameters():
+            #     if hasattr(p, "_params_exec_order_hook_handle"):
+            #         p._params_exec_order_hook_handle.remove()
+            #         delattr(p, "_params_exec_order_hook_handle")
             # Let the parameters in self._fsdp_named_params_exec_order ordered based on
             # the execution order in the forward pass.
-            self._fsdp_named_params_exec_order.reverse()
-
-    def _recursive_unwrap(self, module : torch.nn.Module) -> torch.nn.Module:
-        for name, child in module.named_children():
-            unwrapped_child = self._recursive_unwrap(child)
-            setattr(module, name, unwrapped_child)
-        if isinstance(module, FullyShardedDataParallel):
-            unwrapped_module = module.module
-            self.module_fsdpwrap_map[unwrapped_module] = module
-            return unwrapped_module
-        return module
-
-    def _remove_inner_fsdp_wraps(self) -> None:
-        # TODO (linjianma): Construct a module_fsdpwrap_map whose keys are all children modules with a FSDP wrap,
-        # and values are its FSDP wraps. These children FSDP wraps will be detached from the root FSDP module
-        # and will be used to schedule the parameters (rebuild_full_params and reshard).
-        # TODO (linjianma): Remove all internal FSDP wraps from the root FSDP module.
-        self.module_fsdpwrap_map : Dict[torch.nn.Module, FullyShardedDataParallel] = dict()
-        unwrapped_module = self._recursive_unwrap(self)
-        return self.module_fsdpwrap_map[unwrapped_module]
+            # self._fsdp_named_params_exec_order.reverse()
+            # self._remove_inner_fsdp_wraps()
+            self._patch_forwards()
 
     @contextmanager
     def patch_forward_manager(self):
