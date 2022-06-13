@@ -10,10 +10,19 @@ from torch.testing._internal.common_utils import (
     run_tests,
 )
 
+class Model2(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.m = Model()
+
+    def forward(self, x):
+        return self.m(x)
+
 
 class Model(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(6, 6))
         self.layer0 = torch.nn.Linear(5, 6)
         self.layer1 = torch.nn.Linear(6, 6, bias=False)
         self.layer2 = torch.nn.Sequential(
@@ -27,7 +36,11 @@ class Model(torch.nn.Module):
         # `layer0` -> `layer2` -> `layer1`
         # the forward execution order is NOT consistent with the model definition order.
         z = self.relu(self.layer0(x))
+        z = self.relu(self.layer1(z))
+        z = z @ self.weight
         z = self.relu(self.layer2(z))
+        z = z @ self.weight
+        z = self.relu(self.layer1(z))
         z = self.relu(self.layer1(z))
         return z
 
@@ -61,18 +74,27 @@ class TestFSDPExecOrder(FSDPTest):
     @parametrize("iters", [1, 3])
     def test_fsdp_flatten_params_exec_order(self, sharding_strategy: ShardingStrategy, iters: int):
         """Tests the basic APIs of FSDP with ParamExecOrderWrapPolicy"""
-        fsdp_model = Model.wrap(sharding_strategy, self.device)
-        for _ in range(iters):
-            inp = fsdp_model.module.get_input(self.device)
-            output = fsdp_model(*inp)
-            loss = fsdp_model.module.get_loss(inp, output).to(self.device)
-            fsdp_model.module.run_backward(loss)
-        assert set(fsdp_model.flatten_named_params_exec_order()) == set(list(fsdp_model.named_parameters()))
-        # Since the forward execution order is NOT consistent with the model definition order,
-        # the ordering in flatten_named_params_exec_order should be different from named_parameters
-        assert fsdp_model.flatten_named_params_exec_order() != list(fsdp_model.named_parameters())
-        assert fsdp_model.use_param_exec_order_policy()
-        assert not fsdp_model.is_param_exec_order_prep_stage()
+        fsdp_model = Model() #.wrap(sharding_strategy, self.device)
+        gm = torch.fx.symbolic_trace(fsdp_model)
+        print(gm.graph)
+
+        print(list(gm.graph.nodes)[2].op)
+        print(list(gm.graph.nodes)[2].target)
+
+
+        # for _ in range(iters):
+        #     inp = fsdp_model.module.get_input(self.device)
+        #     output = fsdp_model(*inp)
+        #     loss = fsdp_model.module.get_loss(inp, output).to(self.device)
+        #     fsdp_model.module.run_backward(loss)
+        # for (n, p) in fsdp_model.flatten_named_params_exec_order():
+        #     print(n)
+        # # assert set(fsdp_model.flatten_named_params_exec_order()) == set(list(fsdp_model.named_parameters()))
+        # # # Since the forward execution order is NOT consistent with the model definition order,
+        # # # the ordering in flatten_named_params_exec_order should be different from named_parameters
+        # # assert fsdp_model.flatten_named_params_exec_order() != list(fsdp_model.named_parameters())
+        # # assert fsdp_model.use_param_exec_order_policy()
+        # # assert not fsdp_model.is_param_exec_order_prep_stage()
 
 
 instantiate_parametrized_tests(TestFSDPExecOrder)

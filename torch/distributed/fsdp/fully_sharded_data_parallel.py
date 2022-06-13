@@ -2325,74 +2325,78 @@ class FullyShardedDataParallel(nn.Module):
     def flatten_named_params_exec_order(self):
         return self._fsdp_named_params_exec_order
 
+    def _pre_forward(self, *args: Any, **kwargs: Any) -> None:
+        self._lazy_init()
+
+        # Start of a forward pass.
+        self.training_state = TrainingState_.FORWARD
+        if self._is_root:
+            # TODO: disabling side stream for tensor copies for now, investigate
+            # perf with it on / off.
+            # Place inputs on compute_device. This is a noop if inputs are already
+            # on compute_device. Note that when device_id is specified,
+            # device_id == self.compute_device is guaranteed.
+            # TODO: for mixed precision, move inputs to right device + cast might
+            # be done in one go for performance.
+            args, kwargs = _to_kwargs(args, kwargs, self.compute_device.index, False)
+            args = args[0]
+            kwargs = kwargs[0]
+
+        # Cast inputs to their mixed precision type.
+        if (
+            self._is_root
+            and self._mixed_precision_enabled_for_params()
+        ):
+            input_dtype = self.mixed_precision.param_dtype
+            args, kwargs = self._cast_fp_inputs_to_precision(
+                input_dtype, *args, **kwargs
+            )
+
+        # All-gather full parameters, moving them to compute_device if
+        # necessary.
+        self._rebuild_full_params()
+        # Wait for all_gather full parameters to finish before computation
+        torch.cuda.current_stream().wait_stream(self._streams["all_gather"])
+
+        # Register backward hooks to reshard params and reduce-scatter grads.
+        # These need to be re-registered every forward pass in some cases where grad_fn
+        # is mutated.
+        self._register_post_backward_hooks()
+
+    def _post_forward(self, outputs) -> None:
+        if self.reshard_after_forward:
+            self._free_full_params()
+            if (
+                self._mixed_precision_enabled_for_params()
+            ):
+                self._free_mp_shard(self.params)
+        # Switch to original local shards of params. We maintain this invariant throughout
+        # the code, i.e., ``p.data == p._local_shard`` after each function. This
+        # also ensures that after the first forward, the optimizer state will be
+        # initialized with the correct dtype and (sharded) size, since optimizer
+        # state is typically initialized lazily in ``optim.step()``. Note that
+        # when CPU offload is enabled, _use_param_local_shard implicitly
+        # offloads the local shard to CPU by making p.data point to
+        # p._local_shard, which would reside on CPU.
+        self._use_param_local_shard()
+        # Register pre-backward hooks to all-gather the params for the backward
+        # pass (if output's grad was needed). This won't register anything if
+        # we are in eval mode.
+        outputs = self._register_pre_backward_hooks(outputs)
+        # Done with a forward pass.
+        self.training_state = TrainingState_.IDLE
+        return outputs
+
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         with torch.autograd.profiler.record_function("FullyShardedDataParallel.forward"):
-            self._lazy_init()
-
-            # Start of a forward pass.
-            self.training_state = TrainingState_.FORWARD
-            if self._is_root:
-                # TODO: disabling side stream for tensor copies for now, investigate
-                # perf with it on / off.
-                # Place inputs on compute_device. This is a noop if inputs are already
-                # on compute_device. Note that when device_id is specified,
-                # device_id == self.compute_device is guaranteed.
-                # TODO: for mixed precision, move inputs to right device + cast might
-                # be done in one go for performance.
-                args, kwargs = _to_kwargs(args, kwargs, self.compute_device.index, False)
-                args = args[0]
-                kwargs = kwargs[0]
-
-            # Cast inputs to their mixed precision type.
-            if (
-                self._is_root
-                and self._mixed_precision_enabled_for_params()
-            ):
-                input_dtype = self.mixed_precision.param_dtype
-                args, kwargs = self._cast_fp_inputs_to_precision(
-                    input_dtype, *args, **kwargs
-                )
-
-            # All-gather full parameters, moving them to compute_device if
-            # necessary.
-            self._rebuild_full_params()
-            # Wait for all_gather full parameters to finish before computation
-            torch.cuda.current_stream().wait_stream(self._streams["all_gather"])
-
-            # Register backward hooks to reshard params and reduce-scatter grads.
-            # These need to be re-registered every forward pass in some cases where grad_fn
-            # is mutated.
-            self._register_post_backward_hooks()
+            self._pre_forward(args, kwargs)
             outputs = self._fsdp_wrapped_module(*args, **kwargs)
 
             if self not in self._fsdp_graph_order:
                 self._my_fsdp_idx_in_graph = len(self._fsdp_graph_order)
                 self._fsdp_graph_order.append(self)
 
-            if self.reshard_after_forward:
-                self._free_full_params()
-                if (
-                    self._mixed_precision_enabled_for_params()
-                ):
-                    self._free_mp_shard(self.params)
-            # Switch to original local shards of params. We maintain this invariant throughout
-            # the code, i.e., ``p.data == p._local_shard`` after each function. This
-            # also ensures that after the first forward, the optimizer state will be
-            # initialized with the correct dtype and (sharded) size, since optimizer
-            # state is typically initialized lazily in ``optim.step()``. Note that
-            # when CPU offload is enabled, _use_param_local_shard implicitly
-            # offloads the local shard to CPU by making p.data point to
-            # p._local_shard, which would reside on CPU.
-            self._use_param_local_shard()
-
-            # Register pre-backward hooks to all-gather the params for the backward
-            # pass (if output's grad was needed). This won't register anything if
-            # we are in eval mode.
-            outputs = self._register_pre_backward_hooks(outputs)
-
-            # Done with a forward pass.
-            self.training_state = TrainingState_.IDLE
-
+            outputs = self._post_forward(outputs)
         return outputs
 
     @torch.no_grad()
@@ -3094,8 +3098,6 @@ class FullyShardedDataParallel(nn.Module):
             # Let the parameters in self._fsdp_named_params_exec_order ordered based on
             # the execution order in the forward pass.
             self._fsdp_named_params_exec_order.reverse()
-            self._remove_inner_fsdp_wraps()
-            self._patch_forwards()
 
     def _recursive_unwrap(self, module : torch.nn.Module) -> torch.nn.Module:
         for name, child in module.named_children():
@@ -3116,33 +3118,59 @@ class FullyShardedDataParallel(nn.Module):
         unwrapped_module = self._recursive_unwrap(self)
         return self.module_fsdpwrap_map[unwrapped_module]
 
+    @contextmanager
+    def patch_forward_manager(self):
+        self._param_exec_index : int = 0
+        yield
+        delattr(self, "_param_exec_index")
+
     def _patch_forwards(self):
         self._module_to_forward_map : Dict[torch.nn.Module, Callable] = dict()
-        assert (
-            len(self.module_fsdpwrap_map) > 0
-        ), "self.module_fsdpwrap_map needs to be not empty."
-        for module in self.module_fsdpwrap_map:
-            if module is not self:
-                module.forward = self._patch_forward(module)
-            self.forward = self.module.forward
+        with self.patch_forward_manager():
+            assert (
+                len(self.module_fsdpwrap_map) > 0
+            ), "self.module_fsdpwrap_map needs to be not empty."
+            for module in self.module_fsdpwrap_map:
+                if module is not self:
+                    module.forward = self._patch_forward(module)
+                self.forward = self.module.forward
 
     def _patch_forward(self, module):
 
-        def patched_forward(self, *args: Any, **kwargs: Any) -> Any:
-            # TODO (linjianma): Before each forward(), rebuild_full_params of all parameters that are currently sharded and
+        def isparent(module1 : torch.nn.Module, module2 : torch.nn.Module) -> bool:
+            """
+            Check if module1 is the parent module of module2.
+            """
+            for m in module1.modules():
+                if m is module2:
+                    return True
+            return False
+
+        def patched_forward(*args: Any, **kwargs: Any) -> Any:
+            # Before each forward(), rebuild_full_params of all parameters that are currently sharded and
             # will be used in the forward, and reshard all parameters that are currently full and will not be
             # used in the next forward()
+            _, exec_param = self._fsdp_named_params_exec_order[self._param_exec_index]
+            if exec_param.module is module:
+                self.module_fsdpwrap_map[module]._pre_forward(args, kwargs)
+                self._param_exec_index += 1
             outputs = module(*args, **kwargs)
-            # TODO (linjianma): After each forward(), reshard all parameters just used in the forward, and rebuild_full_params of
+            # After each forward(), reshard all parameters just used in the forward, and rebuild_full_params of
             # all parameters that will be used next.
+            # If exec_param are not used later, free.
+            remaining_params_exec_order = [p for (_, p) in self._fsdp_named_params_exec_order[self._param_exec_index:]]
+            if exec_param not in remaining_params_exec_order:
+                outputs = self.module_fsdpwrap_map[module]._post_forward(outputs)
+            # If the next exec_param.module is the parent module, build them.
+            # If the next exec_param has already been built, _pre_forward() would check this
+            # and will not rebuid again.
+            _, next_exec_param = self._fsdp_named_params_exec_order[self._param_exec_index]
+            if isparent(next_exec_param.module, module):
+                self.module_fsdpwrap_map[next_exec_param.module]._pre_forward(args, kwargs)
+                self._param_exec_index += 1
+            return outputs
 
         return patched_forward
-        # TODO (linjianma): Based on self._fsdp_named_params_exec_order, get the information
-        # needed to patch the forward() function of each key in the module_fsdpwrap_map. The rules are as follows:
-
-
-        # TODO (linjianma): Patch the forward of each model in the keys
-        # of module_fsdpwrap_map based on the information above.
 
     def _update_p_data(self, p, output_tensor: torch.Tensor) -> None:
         """
