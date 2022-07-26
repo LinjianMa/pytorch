@@ -255,6 +255,7 @@ class FlatParamHandle:
         requires_grad: Optional[bool] = None
         for submodule_name, submodule in module.named_modules():
             for param_name, param in submodule.named_parameters(recurse=False):
+                # print(param_name, param.dtype, dtype)
                 if param not in params_set:
                     continue
                 if param in shared_param_memo:
